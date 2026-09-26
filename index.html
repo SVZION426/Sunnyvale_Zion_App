@@ -5,6 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0B0D2A">
 <title>Sunnyvale Zion</title>
+<!-- =====================================================================
+     SUPABASE SETTINGS  ·  paste your two values between the quotes.
+     Supabase → Project Settings → API (or Data API):
+       SUPABASE_URL      = "Project URL"   e.g. https://abcdxyz.supabase.co
+       SUPABASE_ANON_KEY = ""the "anon public" key (a long eyJ... string)""
+     Leave both empty to keep saving on this device only.
+     ===================================================================== -->
+<script>
+var SUPABASE_URL = "https://fyhlgtminxsrqavljisu.supabase.co";
+var SUPABASE_ANON_KEY = "sb_publishable_5Bq_ihY8Elgv-BHK-XVJJg_CdB0bD47";
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Cormorant+Garamond:ital,wght@0,600;1,500&family=Great+Vibes&display=swap" rel="stylesheet">
@@ -1245,11 +1257,94 @@ let admin=false, curTab="today", sheetMode="";
 const person=id=>S.people.find(p=>p.id===id);
 const meP=()=>me&&me!=="leader"?person(me):null;
 
+/* ================= Supabase connector ================= */
+/* Gives the app the same small doc/collection interface it uses everywhere,
+   backed by the public.sz_docs table (see sunnyvale-zion-schema.sql). */
+function makeSupaDB(sb){
+  const T="sz_docs",cache={},subs={},loads={},pend={};let live=false,warned=false;
+  const cp=o=>o==null?o:JSON.parse(JSON.stringify(o));
+  const warn=m=>{if(!warned){warned=true;toast(m);setTimeout(()=>warned=false,15000)}};
+  const docSnap=(id,d)=>({id,exists:d!=null,data:()=>cp(d)==null?undefined:cp(d)});
+  function emit(col){
+    const m=cache[col];if(!m)return;
+    const docs=[...m.entries()].map(([id,d])=>docSnap(id,d));
+    (subs[col]||[]).forEach(s=>{try{s.id!=null?s.cb(docSnap(s.id,m.get(s.id))):s.cb({docs,size:docs.length,empty:!docs.length})}catch(e){console.warn(e)}});
+  }
+  async function fetchAll(col){
+    const out=new Map();let from=0;const N=1000;
+    for(;;){
+      const {data,error}=await sb.from(T).select("id,data").eq("collection",col).order("id").range(from,from+N-1);
+      if(error)throw error;(data||[]).forEach(r=>out.set(r.id,r.data));
+      if(!data||data.length<N)break;from+=N;
+    }
+    return out;
+  }
+  function load(col){
+    if(loads[col])return loads[col];
+    loads[col]=fetchAll(col).then(m=>{
+      for(const k in pend){const [c,id]=k.split("\u0001");if(c===col){pend[k].del?m.delete(id):m.set(id,pend[k].data)}}
+      cache[col]=m;emit(col);
+    }).catch(e=>{console.warn("supabase load",col,e);warn("Can't reach the database. Check the Supabase URL and key.");if(!cache[col]){cache[col]=new Map();emit(col)}})
+      .finally(()=>{delete loads[col]});
+    return loads[col];
+  }
+  const reloadAll=()=>Object.keys(cache).forEach(load);
+  function local(col,id,d,del){
+    if(!cache[col])cache[col]=new Map();
+    del?cache[col].delete(id):cache[col].set(id,cp(d));emit(col);
+  }
+  async function write(col,id,d,del){
+    const k=col+"\u0001"+id,token={data:cp(d),del};pend[k]=token;local(col,id,d,del);
+    try{
+      const {error}=del?await sb.from(T).delete().eq("collection",col).eq("id",id)
+                       :await sb.from(T).upsert({collection:col,id,data:token.data},{onConflict:"collection,id"});
+      if(error)throw error;
+    }catch(e){console.warn("supabase write",col,id,e);warn("Couldn't save. Check your connection.");load(col);throw e}
+    finally{if(pend[k]===token)delete pend[k]}
+  }
+  const split=p=>{const i=p.indexOf("/");return [p.slice(0,i),p.slice(i+1)]};
+  function onSnap(col,id,cb,err){
+    const s={id,cb};(subs[col]=subs[col]||[]).push(s);
+    if(cache[col])setTimeout(()=>{if((subs[col]||[]).includes(s))id!=null?cb(docSnap(id,cache[col].get(id))):emit(col)},0);else load(col);
+    return ()=>{subs[col]=(subs[col]||[]).filter(x=>x!==s)};
+  }
+  const doc=path=>{const [col,id]=split(path);return{
+    id,
+    async get(){
+      if(cache[col])return docSnap(id,cache[col].get(id));
+      const {data,error}=await sb.from(T).select("data").eq("collection",col).eq("id",id).maybeSingle();
+      if(error)throw error;return docSnap(id,data?data.data:null);
+    },
+    set:d=>write(col,id,d,false),
+    delete:()=>write(col,id,null,true),
+    onSnapshot:(cb,err)=>onSnap(col,id,cb,err)
+  }};
+  const collection=col=>({onSnapshot:(cb,err)=>onSnap(col,null,cb,err),doc:id=>doc(col+"/"+id)});
+  /* live updates from other phones */
+  try{
+    sb.channel("sz_docs_live").on("postgres_changes",{event:"*",schema:"public",table:T},p=>{
+      const del=p.eventType==="DELETE",r=del?p.old:p.new;if(!r||!r.collection||!cache[r.collection])return;
+      if(pend[r.collection+"\u0001"+r.id])return;
+      del?cache[r.collection].delete(r.id):cache[r.collection].set(r.id,r.data);emit(r.collection);
+    }).subscribe(st=>{const was=live;live=st==="SUBSCRIBED";if(live&&!was)reloadAll()});
+  }catch(e){console.warn("realtime",e)}
+  /* safety nets: refresh when the app comes back, and poll if live updates are off */
+  document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")reloadAll()});
+  setInterval(()=>{if(!live&&document.visibilityState==="visible")reloadAll()},30000);
+  return {doc,collection,kind:"supabase"};
+}
+
 /* ================= storage ================= */
 const Store={
   mode:"local",db:null,
   async init(){
-    if(window.claude&&typeof window.claude.use==="function"){try{this.db=await window.claude.use("db")}catch(e){this.db=null}}
+    const su=String(window.SUPABASE_URL||"").trim().replace(/\/+$/,""),sk=String(window.SUPABASE_ANON_KEY||"").trim();
+    if(su&&sk){
+      if(window.supabase&&typeof window.supabase.createClient==="function"){
+        try{this.db=makeSupaDB(window.supabase.createClient(su,sk,{auth:{persistSession:false}}))}catch(e){console.warn(e);this.db=null;setTimeout(()=>toast("Supabase settings look wrong. Check the URL and key."),600)}
+      }else setTimeout(()=>toast("Couldn't load Supabase. Check your internet connection."),600);
+    }
+    if(!this.db&&window.claude&&typeof window.claude.use==="function"){try{this.db=await window.claude.use("db")}catch(e){this.db=null}}
     if(this.db){this.mode="db";this.subscribe()}
     else{const saved=lsGet("h_data",null);if(saved)Object.assign(S,saved);S.loaded={people:1,all:1};render()}
     $("#syncNote").textContent=this.mode==="db"?"Synced live with your team":"Saved on this device only";

@@ -1,0 +1,130 @@
+-- ============================================================
+--  Sunnyvale Zion · Supabase schema
+--  Paste this whole file into Supabase → SQL Editor → Run.
+--  Safe to run more than once.
+--
+--  The app keeps every kind of record (people, daily counts,
+--  practices, assignments, STMP, contacts, awards, activity…)
+--  as small JSON documents in ONE table, grouped by "collection".
+--  That matches how the app is built, so nothing in the app
+--  needs to change shape.
+-- ============================================================
+
+
+-- 1) The table ------------------------------------------------
+create table if not exists public.sz_docs (
+  collection  text        not null,
+  id          text        not null,
+  data        jsonb       not null default '{}'::jsonb,
+  updated_at  timestamptz not null default now(),
+  primary key (collection, id),
+  constraint sz_docs_collection_ok check (collection in (
+    'config','people','goals','days','logs','progress','practice',
+    'assignments','announcements','spots','missions','signups',
+    'mlogs','contacts','awards','activity'
+  )),
+  constraint sz_docs_id_ok   check (char_length(id) between 1 and 200),
+  constraint sz_docs_size_ok check (pg_column_size(data) < 262144)   -- 256 KB per record
+);
+
+create index if not exists sz_docs_collection_idx on public.sz_docs (collection);
+create index if not exists sz_docs_updated_idx    on public.sz_docs (updated_at desc);
+
+
+-- 2) Keep updated_at current ---------------------------------
+create or replace function public.sz_touch_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists sz_docs_touch on public.sz_docs;
+create trigger sz_docs_touch
+  before insert or update on public.sz_docs
+  for each row execute function public.sz_touch_updated_at();
+
+
+-- 3) Access rules (Row Level Security) ------------------------
+--  The app signs people in with its own 4-digit PINs, not with
+--  Supabase accounts, so the browser uses the public "anon" key.
+--  These rules let the app read and write its own collections and
+--  nothing else in your project.
+alter table public.sz_docs enable row level security;
+
+drop policy if exists "sz read"   on public.sz_docs;
+drop policy if exists "sz insert" on public.sz_docs;
+drop policy if exists "sz update" on public.sz_docs;
+drop policy if exists "sz delete" on public.sz_docs;
+
+create policy "sz read"   on public.sz_docs
+  for select to anon, authenticated using (true);
+
+create policy "sz insert" on public.sz_docs
+  for insert to anon, authenticated with check (true);
+
+create policy "sz update" on public.sz_docs
+  for update to anon, authenticated using (true) with check (true);
+
+create policy "sz delete" on public.sz_docs
+  for delete to anon, authenticated using (true);
+
+grant select, insert, update, delete on public.sz_docs to anon, authenticated;
+
+
+-- 4) Live updates (Realtime) ----------------------------------
+--  Lets every phone see new counts, assignments and activity
+--  without refreshing.
+alter table public.sz_docs replica identity full;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename  = 'sz_docs'
+  ) then
+    alter publication supabase_realtime add table public.sz_docs;
+  end if;
+end
+$$;
+
+
+-- 5) Check it worked ------------------------------------------
+--  Should return one row: sz_docs | true (RLS on) | true (realtime on)
+select
+  c.relname                                  as table_name,
+  c.relrowsecurity                           as rls_enabled,
+  exists (
+    select 1 from pg_publication_tables p
+    where p.pubname = 'supabase_realtime' and p.tablename = c.relname
+  )                                          as realtime_enabled
+from pg_class c
+join pg_namespace n on n.oid = c.relnamespace
+where n.nspname = 'public' and c.relname = 'sz_docs';
+
+
+-- ============================================================
+--  Useful later (copy one line at a time)
+-- ============================================================
+-- How many records of each kind:
+--   select collection, count(*) from public.sz_docs group by 1 order by 1;
+--
+-- Everyone on the team:
+--   select data->>'name' as name, data->>'role' as role from public.sz_docs
+--   where collection = 'people' order by 1;
+--
+-- Forgot the leader PIN? Delete the saved one and the app goes back to 2026:
+--   update public.sz_docs set data = data - 'pinHash'
+--   where collection = 'config' and id = 'main';
+--
+-- Clear old activity-feed entries (the app also trims after 45 days):
+--   delete from public.sz_docs
+--   where collection = 'activity' and updated_at < now() - interval '45 days';
+--
+-- Start completely over (deletes ALL app data):
+--   truncate public.sz_docs;
