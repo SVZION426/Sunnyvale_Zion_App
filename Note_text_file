@@ -2,3 +2,5 @@ Database password
 
 g&_6X_8EmM$Nt42
 
+var SUPABASE_URL = "https://fyhlgtminxsrqavljisu.supabase.co";
+var SUPABASE_ANON_KEY = "sb_publishable_5Bq_ihY8Elgv-BHK-XVJJg_CdB0bD47";
